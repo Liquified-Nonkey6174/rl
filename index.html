@@ -779,7 +779,7 @@
 
     let opBoostTrailL = null, opBoostTrailR = null;
 
-    const NET_TICK_RATE = 20;
+    const NET_TICK_RATE = 15;
     let netTickTimer = 0;
     let peerConnected = false;
 
@@ -834,7 +834,7 @@
         showMpStatus("Waiting for opponent...");
         isHost = true;
 
-        gameChannel.subscribe("peerState", (msg) => {
+        gameChannel.subscribe("c", (msg) => {
           if (!peerConnected) {
             peerConnected = true;
             showMpStatus("Opponent connected! Starting...");
@@ -872,15 +872,21 @@
         isHost = false;
         gameChannel = ablyClient.channels.get("rl-" + roomCode);
 
-        gameChannel.subscribe("peerState", (msg) => {
-          opponentTargetState = msg.data;
-          if (!peerConnected) {
-            peerConnected = true;
+        gameChannel.subscribe("h", (msg) => {
+          const data = msg.data;
+          if (data.c) opponentTargetState = data.c;
+          if (data.b) ballTargetState = data.b;
+          if (data.t) {
+            matchTime = data.t.mt;
+            isOvertime = !!data.t.ot;
+            overtimeTime = data.t.ott || 0;
+            updateTimerDisplay();
           }
-        });
-
-        gameChannel.subscribe("ballState", (msg) => {
-          ballTargetState = msg.data;
+          if (data.s) {
+            scoreLeft = data.s[0]; scoreRight = data.s[1];
+            updateScore();
+          }
+          if (!peerConnected) peerConnected = true;
         });
 
         gameChannel.subscribe("gameEvent", (msg) => {
@@ -1007,47 +1013,60 @@
       }
     }
 
-    // --- Send state functions ---
+    // --- Send state functions (ONE message per tick) ---
+    let timerSyncCounter = 0;
+
     function sendHostState() {
       if (!gameChannel || !peerConnected) return;
       const c = car;
-      try {
-        gameChannel.publish("peerState", {
-          p: [c.position.x, c.position.y, c.position.z],
-          q: [c.quaternion.x, c.quaternion.y, c.quaternion.z, c.quaternion.w],
-          v: [carVelocity.x, carVelocity.y, carVelocity.z],
-          h: carHeading, g: onGround, b: isBoostingVisual
-        });
-        if (ball) {
-          gameChannel.publish("ballState", {
-            p: [ball.position.x, ball.position.y, ball.position.z],
-            v: [ballVelocity.x, ballVelocity.y, ballVelocity.z],
-            q: [ball.quaternion.x, ball.quaternion.y, ball.quaternion.z, ball.quaternion.w]
-          });
+      const msg = {
+        c: {
+          p: [+c.position.x.toFixed(2), +c.position.y.toFixed(2), +c.position.z.toFixed(2)],
+          q: [+c.quaternion.x.toFixed(3), +c.quaternion.y.toFixed(3), +c.quaternion.z.toFixed(3), +c.quaternion.w.toFixed(3)],
+          v: [+carVelocity.x.toFixed(1), +carVelocity.y.toFixed(1), +carVelocity.z.toFixed(1)],
+          h: +carHeading.toFixed(3), g: onGround ? 1 : 0, b: isBoostingVisual ? 1 : 0
         }
-      } catch(e) {}
+      };
+      if (ball && ball.visible) {
+        msg.b = {
+          p: [+ball.position.x.toFixed(2), +ball.position.y.toFixed(2), +ball.position.z.toFixed(2)],
+          v: [+ballVelocity.x.toFixed(1), +ballVelocity.y.toFixed(1), +ballVelocity.z.toFixed(1)]
+        };
+      }
+      // Timer sync every ~3 seconds (every 45 ticks at 15Hz)
+      timerSyncCounter++;
+      if (timerSyncCounter >= 45) {
+        timerSyncCounter = 0;
+        msg.t = { mt: +matchTime.toFixed(1), ot: isOvertime ? 1 : 0, ott: +overtimeTime.toFixed(1) };
+        msg.s = [scoreLeft, scoreRight];
+      }
+      try { gameChannel.publish("h", msg); } catch(e) {}
     }
 
     function sendClientState() {
       if (!gameChannel || !peerConnected) return;
       const c = car;
       try {
-        gameChannel.publish("peerState", {
-          p: [c.position.x, c.position.y, c.position.z],
-          q: [c.quaternion.x, c.quaternion.y, c.quaternion.z, c.quaternion.w],
-          v: [carVelocity.x, carVelocity.y, carVelocity.z],
-          h: carHeading, g: onGround, b: isBoostingVisual
+        gameChannel.publish("c", {
+          p: [+c.position.x.toFixed(2), +c.position.y.toFixed(2), +c.position.z.toFixed(2)],
+          q: [+c.quaternion.x.toFixed(3), +c.quaternion.y.toFixed(3), +c.quaternion.z.toFixed(3), +c.quaternion.w.toFixed(3)],
+          v: [+carVelocity.x.toFixed(1), +carVelocity.y.toFixed(1), +carVelocity.z.toFixed(1)],
+          h: +carHeading.toFixed(3), g: onGround ? 1 : 0, b: isBoostingVisual ? 1 : 0
         });
       } catch(e) {}
     }
 
-    // --- Update opponent car from network ---
+    // --- Update opponent car from network (with velocity extrapolation) ---
     function updateOpponentCar(dt) {
       if (!opponentCar || !opponentTargetState) return;
       const t = opponentTargetState;
-      const lerpF = Math.min(1, dt * 14);
+      const lerpF = Math.min(1, dt * 10);
 
+      // Extrapolate target position using velocity
       const tp = new THREE.Vector3(t.p[0], t.p[1], t.p[2]);
+      const tv = new THREE.Vector3(t.v[0], t.v[1], t.v[2]);
+      tp.addScaledVector(tv, dt * 0.5); // half-step extrapolation
+
       opponentCar.position.lerp(tp, lerpF);
 
       const tq = new THREE.Quaternion(t.q[0], t.q[1], t.q[2], t.q[3]);
@@ -1055,24 +1074,62 @@
 
       opponentCarVelocity.set(t.v[0], t.v[1], t.v[2]);
       opponentCarHeading = t.h;
-      opponentOnGround = t.g;
+      opponentOnGround = !!t.g;
       opponentIsBoostingVisual = !!t.b;
     }
 
-    // --- Update ball from host (client only) ---
-    function updateBallFromHost(dt) {
-      if (!ball || !ballTargetState) return;
-      const t = ballTargetState;
-      const lerpF = Math.min(1, dt * 14);
+    // --- Client ball: run local physics + blend toward host state ---
+    function updateBallClientPredicted(dt) {
+      if (!ball) return;
 
-      const tp = new THREE.Vector3(t.p[0], t.p[1], t.p[2]);
-      ball.position.lerp(tp, lerpF);
+      // Run local ball physics (same as host)
+      ballVelocity.y += gravity * dt;
+      ball.position.addScaledVector(ballVelocity, dt);
 
-      ballVelocity.set(t.v[0], t.v[1], t.v[2]);
+      // Ground bounce
+      if (ball.position.y - ballRadius <= 0) {
+        ball.position.y = ballRadius;
+        if (ballVelocity.y < 0) ballVelocity.y *= -0.85;
+      }
 
-      if (t.q) {
-        const tq = new THREE.Quaternion(t.q[0], t.q[1], t.q[2], t.q[3]);
-        ball.quaternion.slerp(tq, lerpF);
+      const halfW = fieldWidth / 2;
+      const halfL = fieldLength / 2;
+
+      // Side walls
+      if (ball.position.x - ballRadius < -halfW) { ball.position.x = -halfW + ballRadius; if (ballVelocity.x < 0) ballVelocity.x *= -0.85; }
+      if (ball.position.x + ballRadius >  halfW) { ball.position.x =  halfW - ballRadius; if (ballVelocity.x > 0) ballVelocity.x *= -0.85; }
+
+      // Goal mouth
+      const inMouthX = Math.abs(ball.position.x) <= (goalWidth/2 - ballRadius);
+      const inMouthY = (ball.position.y >= ballRadius) && (ball.position.y <= (goalHeight - ballRadius));
+      const inMouth = inMouthX && inMouthY;
+      if (!inMouth) {
+        if (ball.position.z - ballRadius < -halfL) { ball.position.z = -halfL + ballRadius; if (ballVelocity.z < 0) ballVelocity.z *= -0.85; }
+        if (ball.position.z + ballRadius >  halfL) { ball.position.z =  halfL - ballRadius; if (ballVelocity.z > 0) ballVelocity.z *= -0.85; }
+      }
+
+      ballVelocity.multiplyScalar(Math.pow(0.995, dt * 60));
+
+      // Blend toward host authoritative state
+      if (ballTargetState) {
+        const t = ballTargetState;
+        const hostPos = new THREE.Vector3(t.p[0], t.p[1], t.p[2]);
+        const hostVel = new THREE.Vector3(t.v[0], t.v[1], t.v[2]);
+
+        // Smooth correction — blend position and snap velocity
+        const correctionF = Math.min(1, dt * 8);
+        ball.position.lerp(hostPos, correctionF);
+        ballVelocity.lerp(hostVel, correctionF * 1.5);
+      }
+
+      // Spin visual
+      const horizVel = new THREE.Vector3(ballVelocity.x, 0, ballVelocity.z);
+      const speed = horizVel.length();
+      if (speed > 0.0001) {
+        const dir = horizVel.clone().normalize();
+        const up = new THREE.Vector3(0, 1, 0);
+        const axis = new THREE.Vector3().crossVectors(dir, up).normalize();
+        if (!isNaN(axis.x)) ball.rotateOnAxis(axis, (speed / ballRadius) * dt);
       }
 
       // Update indicator
@@ -2996,8 +3053,10 @@ M: Toggle minimap`;
                 checkGoal();
                 updateMatchTimer(dt);
               } else {
-                // Client: ball comes from host
-                updateBallFromHost(dt);
+                // Client: run local ball physics + blend toward host state
+                updateBallClientPredicted(dt);
+                // Client also ticks timer locally (host corrects periodically)
+                updateMatchTimer(dt);
               }
             }
           } else {
@@ -3026,17 +3085,8 @@ M: Toggle minimap`;
         netTickTimer += scaledDt;
         if (netTickTimer >= 1 / NET_TICK_RATE) {
           netTickTimer -= 1 / NET_TICK_RATE;
-          if (isHost) {
-            sendHostState();
-            // Periodically sync timer
-            if (gameState === "playing") {
-              gameChannel.publish("gameEvent", {
-                type: "timer", mt: matchTime, ot: isOvertime, ott: overtimeTime
-              });
-            }
-          } else {
-            sendClientState();
-          }
+          if (isHost) sendHostState();
+          else sendClientState();
         }
       }
 
@@ -3745,8 +3795,11 @@ function updateGoalpostProximity() {
         if (matchTime <= 0) {
           matchTime = 0;
           updateTimerDisplay();
-          if (scoreLeft === scoreRight) startOvertime();
-          else endMatch();
+          // Only host triggers end-game logic
+          if (!isMultiplayer || isHost) {
+            if (scoreLeft === scoreRight) startOvertime();
+            else endMatch();
+          }
         } else {
           updateTimerDisplay();
         }
